@@ -16,6 +16,11 @@ import type {
 } from './types';
 import type { Database } from '..';
 
+type PersistedTable = {
+  name: string;
+  dependsOn?: Array<{ name: string }>;
+};
+
 // TODO: get that list dynamically instead
 const RESERVED_TABLE_NAMES = [
   'strapi_migrations',
@@ -349,19 +354,20 @@ export default (db: Database) => {
   const diffSchemas = async ({
     previousSchema,
     databaseSchema,
-    currentSchema,
+    userSchema,
   }: {
     previousSchema: Schema;
     databaseSchema: Schema;
-    currentSchema: Schema;
+    userSchema: Schema;
   }): Promise<SchemaDiff> => {
     const addedTables: Table[] = [];
     const updatedTables: TableDiff['diff'][] = [];
     const unchangedTables: Table[] = [];
     const removedTables: Table[] = [];
 
-    for (const destTable of destSchema.tables) {
-      const srcTable = helpers.findTable(srcSchema, destTable.name);
+    // for each table in the current schema, check if it exists in the database schema
+    for (const destTable of userSchema.tables) {
+      const srcTable = helpers.findTable(databaseSchema, destTable.name);
       if (srcTable) {
         const { status, diff } = diffTables(srcTable, destTable);
 
@@ -375,6 +381,7 @@ export default (db: Database) => {
       }
     }
 
+    // maintain audit logs table from EE -> CE
     const parsePersistedTable = (persistedTable: string | Table) => {
       if (typeof persistedTable === 'string') {
         return persistedTable;
@@ -382,8 +389,9 @@ export default (db: Database) => {
       return persistedTable.name;
     };
 
-    const persistedTables = helpers.hasTable(srcSchema, 'strapi_core_store_settings')
-      ? (await strapi.store.get({
+    const persistedTables = helpers.hasTable(databaseSchema, 'strapi_core_store_settings')
+      ? // TODO: replace with low level db query instead
+        (await strapi.store.get({
           type: 'core',
           key: 'persisted_tables',
         })) ?? []
@@ -391,13 +399,18 @@ export default (db: Database) => {
 
     const reservedTables = [...RESERVED_TABLE_NAMES, ...persistedTables.map(parsePersistedTable)];
 
-    type PersistedTable = {
-      name: string;
-      dependsOn?: Array<{ name: string }>;
-    };
 
-    for (const srcTable of srcSchema.tables) {
-      if (!helpers.hasTable(destSchema, srcTable.name) && !reservedTables.includes(srcTable.name)) {
+    for (const srcTable of databaseSchema.tables) {
+
+      // TODO: if db table is not in the user schema and not in the stored schema -> don't touch it it's not tracked
+
+      // if a db table is not in the user schema I want to delete it
+      if (
+        !helpers.hasTable(userSchema, srcTable.name) &&
+        !reservedTables.includes(srcTable.name)
+      ) {
+
+
         const dependencies = persistedTables
           .filter((table: PersistedTable) => {
             const dependsOn = table?.dependsOn;
@@ -409,7 +422,7 @@ export default (db: Database) => {
             return dependsOn.some((table) => table.name === srcTable.name);
           })
           .map((dependsOnTable: PersistedTable) => {
-            return srcSchema.tables.find((srcTable) => srcTable.name === dependsOnTable.name);
+            return databaseSchema.tables.find((srcTable) => srcTable.name === dependsOnTable.name);
           })
           // In case the table is not found, filter undefined values
           .filter((table: PersistedTable) => !_.isNil(table));
